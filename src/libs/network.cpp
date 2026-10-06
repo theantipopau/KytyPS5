@@ -2427,6 +2427,10 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
+	// Winsock rejects MSG_PEEK | MSG_WAITALL with WSAEOPNOTSUPP on datagram sockets, while a
+	// datagram is delivered whole anyway; only stream receives keep the combined flag.
+	const int recv_flags =
+	    transport->type == SOCK_STREAM ? host_flags : (host_flags & ~MSG_WAITALL);
 #if defined(_WIN32)
 	if (transport->type == SOCK_STREAM) {
 		if (addr != nullptr &&
@@ -2443,9 +2447,9 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	{
 		transport.reset();
 		if (addr == nullptr) {
-			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+			result = ::recv(socket, static_cast<char*>(buf), host_len, recv_flags);
 		} else {
-			result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
+			result = ::recvfrom(socket, static_cast<char*>(buf), host_len, recv_flags,
 			                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
 		}
 	}
