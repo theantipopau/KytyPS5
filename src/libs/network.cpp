@@ -850,23 +850,39 @@ using SocketIoLength                                = size_t;
 #endif
 
 struct SocketTransport {
-	explicit SocketTransport(NativeSocket value): socket(value) {}
+	SocketTransport(NativeSocket value, int socket_type): socket(value), type(socket_type) {}
 	~SocketTransport() { Close(); }
+	bool HasPendingReceive() const {
+#if defined(_WIN32)
+		return buffered_bytes.load(std::memory_order_relaxed) != 0 ||
+		       receive_shutdown.load(std::memory_order_relaxed);
+#else
+		return false;
+#endif
+	}
 	int Close() {
-		if (socket == INVALID_NATIVE_SOCKET) {
+#if defined(_WIN32)
+		receive_shutdown.store(true, std::memory_order_relaxed);
+#endif
+		const auto value = socket.exchange(INVALID_NATIVE_SOCKET);
+		if (value == INVALID_NATIVE_SOCKET) {
 			return 0;
 		}
-		const auto value = std::exchange(socket, INVALID_NATIVE_SOCKET);
 #if defined(_WIN32)
 		return closesocket(value);
 #else
 		return ::close(value);
 #endif
 	}
-	NativeSocket socket;
+	std::atomic<NativeSocket> socket;
+	const int                type;
 #if defined(_WIN32)
 	// Winsock cannot report the current mode, so the guest blocking mode is tracked here.
 	std::atomic_bool nonblocking {false};
+	std::mutex         receive_mutex;
+	std::vector<char>  receive_buffer;
+	std::atomic_size_t buffered_bytes   = 0;
+	std::atomic_bool   receive_shutdown = false;
 #endif
 };
 
@@ -1099,98 +1115,6 @@ static int ConvertMessageFlags(int flags) {
 	return host_flags;
 }
 
-static int64_t RecvHost(NativeSocket socket, char* buf, SocketIoLength host_len, int host_flags,
-                        sockaddr_storage* host_addr, SocketLength* host_addrlen) {
-	if (host_addr == nullptr) {
-		return ::recv(socket, buf, host_len, host_flags);
-	}
-	return ::recvfrom(socket, buf, host_len, host_flags, reinterpret_cast<sockaddr*>(host_addr),
-	                  host_addrlen);
-}
-
-#if defined(_WIN32)
-static bool IsSocketNonBlocking(int guest_fd) {
-	Common::LockGuard lock(g_socket_mutex);
-	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
-		return false;
-	}
-	const auto& slot = g_sockets[static_cast<size_t>(guest_fd)];
-	return slot.transport != nullptr && slot.transport->nonblocking;
-}
-
-static bool SocketIsStream(NativeSocket socket) {
-	int          type = 0;
-	SocketLength len  = sizeof(type);
-	return getsockopt(socket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &len) == 0 &&
-	       type == SOCK_STREAM;
-}
-
-// A peek never consumes, so the buffered prefix keeps the socket readable and a poll would
-// return immediately. The retries are paced instead, and the poll is only used to notice a
-// closed or reset peer, which ends the wait with the short read the guest expects. A blocking
-// MSG_WAITALL may otherwise wait indefinitely: that is the requested semantics when a peer
-// stays open but sends only a prefix, so imposing an arbitrary timeout would truncate it.
-static short PollSocket(NativeSocket socket) {
-	WSAPOLLFD event {};
-	event.fd     = socket;
-	event.events = POLLRDNORM;
-	return WSAPoll(&event, 1, 0) > 0 ? event.revents : 0;
-}
-
-static bool WaitForPeekedBytes(NativeSocket socket) {
-	std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	constexpr short terminal_events = POLLHUP | POLLERR | POLLNVAL;
-	return (PollSocket(socket) & terminal_events) != 0;
-}
-
-// Winsock rejects MSG_PEEK | MSG_WAITALL with WSAEOPNOTSUPP, so the requested length is
-// waited for by peeking until it is buffered. Datagram sockets ignore MSG_WAITALL and
-// non-blocking sockets hand back whatever arrived, matching the guest (FreeBSD) behaviour.
-static int64_t RecvPeekWaitAll(NativeSocket socket, bool nonblocking, bool no_wait, char* buf,
-                               SocketIoLength host_len, sockaddr_storage* host_addr,
-                               SocketLength* host_addrlen) {
-	if (host_len == 0 && (host_addr == nullptr || SocketIsStream(socket))) {
-		// Winsock blocks on a zero length receive from an empty stream socket, while the
-		// guest expects an immediate zero. Datagram peeks still report the source address.
-		return 0;
-	}
-	if (no_wait && !nonblocking) {
-		// Winsock has no MSG_DONTWAIT, so readiness decides whether a peek may run at all.
-		constexpr short input_events = POLLRDNORM | POLLHUP | POLLERR;
-		if ((PollSocket(socket) & input_events) == 0) {
-			return SetGuestSocketError(Posix::POSIX_EWOULDBLOCK);
-		}
-	}
-	bool peer_closed = false;
-	for (;;) {
-		char                 scratch = 0;
-		char*                peek_buf = buf;
-		SocketIoLength       peek_len = host_len;
-		if (peek_len == 0 && host_addr != nullptr && !SocketIsStream(socket)) {
-			// Winsock may reject a zero-length datagram peek before filling from. A
-			// one-byte scratch buffer keeps MSG_PEEK semantics while obtaining the source.
-			peek_buf = &scratch;
-			peek_len = 1;
-		}
-		const int64_t peeked =
-		    RecvHost(socket, peek_buf, peek_len, MSG_PEEK, host_addr, host_addrlen);
-		if (peeked < 0) {
-			if (WSAGetLastError() == WSAEMSGSIZE) {
-				// Winsock copied a truncated datagram prefix, but a zero-length peek can also
-				// report the non-empty message this way. The outer receive maps both to len.
-				return host_len;
-			}
-			return SetHostSocketError();
-		}
-		if (peeked >= host_len || peeked == 0 || peer_closed || nonblocking || no_wait ||
-		    !SocketIsStream(socket)) {
-			return peeked;
-		}
-		peer_closed = WaitForPeekedBytes(socket);
-	}
-}
-#endif
-
 static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_storage* out,
                                 SocketLength* out_len) {
 	EXIT_IF(out == nullptr);
@@ -1261,7 +1185,8 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, SocketLength addrle
 	return 0;
 }
 
-static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state = nullptr) {
+static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state = nullptr,
+                             std::shared_ptr<SocketTransport>* transport = nullptr) {
 	EXIT_IF(out == nullptr);
 
 	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
@@ -1284,6 +1209,9 @@ static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state 
 	*out = slot.transport->socket;
 	if (state != nullptr) {
 		*state = slot;
+	}
+	if (transport != nullptr) {
+		*transport = slot.transport;
 	}
 	return true;
 }
@@ -1329,6 +1257,63 @@ static int AllocSocketFd(const std::shared_ptr<SocketTransport>& transport, bool
 	}
 
 	return -1;
+}
+
+static int SelectSockets(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
+                         timeval* timeout,
+                         const std::vector<std::shared_ptr<SocketTransport>>& stream_reads) {
+#if defined(_WIN32)
+	if (!stream_reads.empty()) {
+		const auto requested_read   = *readfds;
+		const auto requested_write  = writefds != nullptr ? *writefds : fd_set {};
+		const auto requested_except = exceptfds != nullptr ? *exceptfds : fd_set {};
+		std::optional<std::chrono::steady_clock::time_point> deadline;
+		if (timeout != nullptr) {
+			deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout->tv_sec) +
+			           std::chrono::microseconds(timeout->tv_usec);
+		}
+		for (;;) {
+			*readfds = requested_read;
+			if (writefds != nullptr) {
+				*writefds = requested_write;
+			}
+			if (exceptfds != nullptr) {
+				*exceptfds = requested_except;
+			}
+			const bool ready = std::any_of(stream_reads.begin(), stream_reads.end(),
+			    [](const auto& transport) { return transport->HasPendingReceive(); });
+			// A concurrent peek can move native bytes into the guest buffer after this check.
+			// Bound native waits so both readiness sources are rechecked without holding receive locks.
+			auto wait = std::chrono::microseconds(ready ? 0 : 10'000);
+			if (deadline) {
+				const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+				    *deadline - std::chrono::steady_clock::now());
+				wait = std::min(wait, std::max(remaining, std::chrono::microseconds::zero()));
+			}
+			timeval slice {};
+			slice.tv_usec = static_cast<long>(wait.count());
+			int result = ::select(nfds, readfds, writefds, exceptfds, &slice);
+			if (result < 0) {
+				return result;
+			}
+			for (const auto& transport: stream_reads) {
+				const auto socket = transport->socket.load();
+				if (socket == INVALID_NATIVE_SOCKET) {
+					WSASetLastError(WSAENOTSOCK);
+					return SOCKET_ERROR;
+				}
+				if (transport->HasPendingReceive() && !FD_ISSET(socket, readfds)) {
+					FD_SET(socket, readfds);
+					result++;
+				}
+			}
+			if (result != 0 || (deadline && std::chrono::steady_clock::now() >= *deadline)) {
+				return result;
+			}
+		}
+	}
+#endif
+	return ::select(nfds, readfds, writefds, exceptfds, timeout);
 }
 
 static bool GuestFdIsSet(const void* fds, int fd) {
@@ -1718,6 +1703,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 	FD_ZERO(&host_except);
 
 	std::vector<HostRegistration> host_registrations;
+	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
 	host_registrations.reserve(registrations.size());
 	int host_nfds = 0;
 	for (const auto& registration: registrations) {
@@ -1738,6 +1724,11 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 #endif
 		if ((registration.event.events & EPOLL_IN) != 0) {
 			FD_SET(socket, &host_read);
+#if defined(_WIN32)
+			if (state.transport->type == SOCK_STREAM) {
+				stream_reads.push_back(state.transport);
+			}
+#endif
 		}
 		if ((registration.event.events & EPOLL_OUT) != 0) {
 			FD_SET(socket, &host_write);
@@ -1757,8 +1748,8 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 		host_timeout.tv_usec = timeout % 1000000;
 		host_timeout_ptr     = &host_timeout;
 	}
-
-	const int result = ::select(host_nfds, &host_read, &host_write, &host_except, host_timeout_ptr);
+	const int result = SelectSockets(host_nfds, &host_read, &host_write, &host_except,
+	                                 host_timeout_ptr, stream_reads);
 	if (result < 0) {
 		return SetHostSocketError();
 	}
@@ -1824,7 +1815,12 @@ int KYTY_SYSV_ABI SocketClose(int s) {
 	}
 	RemoveSocketFromEpolls(s);
 
-	if (slot.transport.use_count() == 1 && slot.transport->Close() != 0) {
+	bool close_transport = slot.transport.use_count() == 1;
+#if defined(_WIN32)
+	// Retained receive/readiness state must not defer native TCP close cancellation.
+	close_transport |= !slot.p2p && slot.transport->type == SOCK_STREAM;
+#endif
+	if (close_transport && slot.transport->Close() != 0) {
 		return NET_ERROR_EBADF;
 	}
 
@@ -1859,7 +1855,7 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 		return SetHostSocketError();
 	}
 
-	auto transport = std::make_shared<SocketTransport>(socket);
+	auto transport = std::make_shared<SocketTransport>(socket, p2p ? SOCK_DGRAM : type);
 	if (p2p) {
 		// Logical sockets keep their own blocking mode; the shared transport never blocks.
 #if defined(_WIN32)
@@ -2043,10 +2039,10 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	auto transport = std::make_shared<SocketTransport>(accepted);
+	auto transport = std::make_shared<SocketTransport>(accepted, SOCK_STREAM);
 #if defined(_WIN32)
 	// FreeBSD accept(2) inherits O_NONBLOCK. Keep both the native Winsock mode and the
-	// guest-side flag in sync so later PEEK | WAITALL calls preserve that behavior.
+	// guest-side flag in sync so later receives preserve that behavior.
 	u_long nonblocking = state.transport->nonblocking ? 1 : 0;
 	if (ioctlsocket(accepted, FIONBIO, &nonblocking) == SOCKET_ERROR) {
 		return SetHostSocketError();
@@ -2081,8 +2077,9 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 	     "\t how = %d\n",
 	     s, how);
 
-	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	NativeSocket                    socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
 
@@ -2094,6 +2091,9 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 #if defined(_WIN32)
 	if (::shutdown(socket, how) == SOCKET_ERROR) {
 		return SetHostSocketError();
+	}
+	if (how == SD_RECEIVE || how == SD_BOTH) {
+		transport->receive_shutdown.store(true, std::memory_order_relaxed);
 	}
 
 	return 0;
@@ -2318,6 +2318,77 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 	return result;
 }
 
+#if defined(_WIN32)
+static int ReceiveStream(SocketTransport& transport, char* output, int length, int flags,
+                         bool dontwait) {
+	std::unique_lock lock(transport.receive_mutex, std::defer_lock);
+	if (dontwait) {
+		if (!lock.try_lock()) {
+			return SetGuestSocketError(Posix::POSIX_EWOULDBLOCK);
+		}
+	} else {
+		lock.lock();
+	}
+	if (transport.receive_shutdown.load(std::memory_order_relaxed)) {
+		return SetGuestSocketError(Posix::POSIX_ESHUTDOWN);
+	}
+	auto&           buffered = transport.receive_buffer;
+	const bool      peek     = (flags & MSG_PEEK) != 0;
+	const bool      waitall  = (flags & MSG_WAITALL) != 0;
+	int             copied   = static_cast<int>(std::min<size_t>(buffered.size(), length));
+	if (copied != 0) {
+		std::memcpy(output, buffered.data(), copied);
+		if (!peek) {
+			buffered.erase(buffered.begin(), buffered.begin() + copied);
+			transport.buffered_bytes.store(buffered.size(), std::memory_order_relaxed);
+		}
+	}
+	if (copied == length || (copied != 0 && !waitall)) {
+		return copied;
+	}
+
+	// Winsock rejects PEEK | WAITALL. Consume into transport-owned storage when peeking,
+	// and let ordinary recv report EOF, timeouts, or nonblocking partial progress.
+	flags &= ~(MSG_PEEK | MSG_WAITALL);
+	do {
+		if (transport.receive_shutdown.load(std::memory_order_relaxed)) {
+			return copied != 0 ? copied : SetGuestSocketError(Posix::POSIX_ESHUTDOWN);
+		}
+		const auto socket = transport.socket.load();
+		if (dontwait) {
+			fd_set readable {};
+			FD_SET(socket, &readable);
+			timeval immediate {};
+			const int ready = ::select(0, &readable, nullptr, nullptr, &immediate);
+			if (ready <= 0) {
+				return copied != 0 ? copied : (ready < 0 ? SetHostSocketError() :
+				    SetGuestSocketError(Posix::POSIX_EWOULDBLOCK));
+			}
+		}
+		const auto previous_size = buffered.size();
+		const int  requested     = peek ? std::min(length - copied, 64 * 1024) : length - copied;
+		char*      destination   = output + copied;
+		if (peek) {
+			buffered.resize(previous_size + requested);
+			destination = buffered.data() + previous_size;
+		}
+		const int received = ::recv(socket, destination, requested, flags);
+		if (peek) {
+			if (received > 0) {
+				std::memcpy(output + copied, destination, received);
+			}
+			buffered.resize(previous_size + std::max(received, 0));
+			transport.buffered_bytes.store(buffered.size(), std::memory_order_relaxed);
+		}
+		if (received <= 0) {
+			return copied != 0 || received == 0 ? copied : SetHostSocketError();
+		}
+		copied += received;
+	} while (waitall && copied < length);
+	return copied;
+}
+#endif
+
 int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags) {
 	return Recvfrom(s, buf, len, flags, nullptr, nullptr);
 }
@@ -2340,8 +2411,9 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		return -1;
 	}
 
-	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	NativeSocket                    socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
 
@@ -2352,26 +2424,31 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
-	sockaddr_storage  host_addr {};
-	SocketLength      host_addrlen = sizeof(host_addr);
-	sockaddr_storage* source_addr  = addr != nullptr ? &host_addr : nullptr;
-	int64_t           result       = 0;
+	sockaddr_storage host_addr {};
+	SocketLength     host_addrlen = sizeof(host_addr);
+	int64_t          result       = 0;
 #if defined(_WIN32)
-	if ((host_flags & (MSG_PEEK | MSG_WAITALL)) == (MSG_PEEK | MSG_WAITALL)) {
-		result = RecvPeekWaitAll(socket, IsSocketNonBlocking(s), (flags & guest_msg_dontwait) != 0,
-		                         static_cast<char*>(buf), host_len, source_addr, &host_addrlen);
-		if (result < 0) {
-			// RecvPeekWaitAll reports guest errors itself.
-			return -1;
+	if (transport->type == SOCK_STREAM) {
+		if (addr != nullptr &&
+		    ::getpeername(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) != 0) {
+			return SetHostSocketError();
 		}
-	} else {
-		result = RecvHost(socket, static_cast<char*>(buf), host_len, host_flags, source_addr,
-		                  &host_addrlen);
-	}
-#else
-	result =
-	    RecvHost(socket, static_cast<char*>(buf), host_len, host_flags, source_addr, &host_addrlen);
+		result = ReceiveStream(*transport, static_cast<char*>(buf), host_len, host_flags,
+		                       (flags & 0x80) != 0);
+		if (result < 0) {
+			return result;
+		}
+	} else
 #endif
+	{
+		transport.reset();
+		if (addr == nullptr) {
+			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+		} else {
+			result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
+			                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+		}
+	}
 #if defined(_WIN32)
 	if (result < 0 && WSAGetLastError() == WSAEMSGSIZE) {
 		// Winsock copied the datagram prefix; POSIX reports its length as success.
@@ -2427,6 +2504,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	FD_ZERO(&host_except);
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
+	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
 	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
 		const bool read = GuestFdIsSet(readfds, fd);
@@ -2435,13 +2513,14 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		if (!read && !write && !except) {
 			continue;
 		}
-		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
+		std::shared_ptr<SocketTransport> transport;
 #if !defined(_WIN32)
 		if (fd < 3) {
 			socket = fd;
 		} else
 #endif
-		if (!GetSocketBackend(fd, &socket)) {
+		if (!GetSocketBackend(fd, &socket, nullptr, &transport)) {
 			return -1;
 		}
 #if defined(_WIN32)
@@ -2459,6 +2538,11 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		descriptors.emplace_back(fd, socket);
 		if (read) {
 			FD_SET(socket, &host_read);
+#if defined(_WIN32)
+			if (transport->type == SOCK_STREAM) {
+				stream_reads.push_back(std::move(transport));
+			}
+#endif
 		}
 		if (write) {
 			FD_SET(socket, &host_write);
@@ -2489,9 +2573,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	} else
 #endif
 	{
-		result = ::select(host_nfds, readfds != nullptr ? &host_read : nullptr,
-		                  writefds != nullptr ? &host_write : nullptr,
-		                  exceptfds != nullptr ? &host_except : nullptr, host_timeout_ptr);
+		result = SelectSockets(host_nfds, readfds != nullptr ? &host_read : nullptr,
+		                       writefds != nullptr ? &host_write : nullptr,
+		                       exceptfds != nullptr ? &host_except : nullptr, host_timeout_ptr,
+		                       stream_reads);
 		if (result < 0) {
 			return SetHostSocketError();
 		}
@@ -2500,15 +2585,19 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	GuestFdZero(readfds, nfds);
 	GuestFdZero(writefds, nfds);
 	GuestFdZero(exceptfds, nfds);
+	result = 0;
 	for (const auto& [fd, socket]: descriptors) {
 		if (FD_ISSET(socket, &host_read)) {
 			GuestFdSet(readfds, fd);
+			result++;
 		}
 		if (FD_ISSET(socket, &host_write)) {
 			GuestFdSet(writefds, fd);
+			result++;
 		}
 		if (FD_ISSET(socket, &host_except)) {
 			GuestFdSet(exceptfds, fd);
+			result++;
 		}
 	}
 	return result;
