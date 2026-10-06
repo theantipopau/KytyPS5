@@ -1272,8 +1272,24 @@ void CheckSocketWakeup() {
   Check(returned_before_completion && inherited_result == prefix_length &&
             std::memcmp(inherited_message.data(), text, prefix_length) == 0,
         "accepted nonblocking PEEK and WAITALL returns the prefix");
-  Check(Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(), 0) ==
-            text_length,
+  // The buffered receive layer replays the peeked prefix from its own storage and returns it
+  // before draining the socket, so the message is consumed a chunk at a time. The accepted
+  // socket is non-blocking, hence the bounded would-block retry until the suffix shows up.
+  size_t inherited_consumed = 0;
+  for (int attempt = 0; inherited_consumed < text_length && attempt < 200; ++attempt) {
+    const auto inherited_chunk =
+        Net::Recv(inherited_reader, inherited_message.data() + inherited_consumed,
+                  text_length - inherited_consumed, 0);
+    if (inherited_chunk > 0) {
+      inherited_consumed += static_cast<size_t>(inherited_chunk);
+      continue;
+    }
+    Check(inherited_chunk == -1 && *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+          "accepted-mode consume reports would-block between chunks");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Check(inherited_consumed == text_length &&
+            std::memcmp(inherited_message.data(), text, text_length) == 0,
         "consume accepted-mode peeked message");
   Check(Net::SocketClose(inherited_reader) == 0 &&
             Net::SocketClose(inherited_writer) == 0 &&
