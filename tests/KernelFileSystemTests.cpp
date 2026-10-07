@@ -1212,7 +1212,7 @@ void CheckSocketWakeup() {
         "send the first fragment");
   const char* const second_fragment = text + text_length / 2;
   const std::size_t second_length   = text_length - text_length / 2;
-  std::thread peer([&writer, second_fragment, second_length] {
+  std::thread fragment_sender([&writer, second_fragment, second_length] {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     Net::Send(writer, second_fragment, second_length, 0);
   });
@@ -1220,7 +1220,7 @@ void CheckSocketWakeup() {
   Check(Net::Recv(reader, message.data(), message.size(), 0x42) == message.size() &&
             std::memcmp(message.data(), text, text_length) == 0,
         "guest PEEK and WAITALL waits for a fragmented message");
-  peer.join();
+  fragment_sender.join();
   Check(Net::Recv(reader, message.data(), message.size(), 0) == message.size() &&
             std::memcmp(message.data(), text, text_length) == 0,
         "peeked bytes stay available for the following receive");
