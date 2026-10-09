@@ -9,6 +9,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -333,6 +334,7 @@ bool SysFileUnlink(sys_file_t& /*f*/, const std::filesystem::path& name) {
 	return SysFileDeleteFile(name);
 }
 
+// Seeks a file; for memory-backed files the position is clamped to the buffer size.
 bool SysFileSeek(sys_file_t& f, uint64_t offset) {
 	bool ok = true;
 	if (f.type == SYS_FILE_FILE) {
@@ -342,7 +344,7 @@ bool SysFileSeek(sys_file_t& f, uint64_t offset) {
 		//		SetFilePointerEx(f.handle, s, 0, FILE_BEGIN);
 		// printf("seek: %u\n", offset);
 	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
-		f.buf->ptr = f.buf->base + offset;
+		f.buf->ptr = f.buf->base + std::min(offset, static_cast<uint64_t>(f.buf->size));
 	}
 	return ok;
 }

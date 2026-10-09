@@ -2396,6 +2396,7 @@ int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int pr
 	return MapFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
+// Configures a PRT aperture; rejects misaligned or out-of-range (including overflowing) address/len with EINVAL.
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	PRINT_NAME();
 
@@ -2414,7 +2415,7 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 
 	if (len != 0 && (address == 0 || (address & (PRT_PAGE_SIZE - 1u)) != 0 ||
 	                 (len & (PRT_PAGE_SIZE - 1u)) != 0 || address < PRT_APERTURE_START ||
-	                 len > PRT_APERTURE_END - address)) {
+	                 address > PRT_APERTURE_END || len > PRT_APERTURE_END - address)) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
