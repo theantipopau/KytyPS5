@@ -639,6 +639,11 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EBADF;
 	}
 
+	// A concurrent KernelClose() may already have closed this descriptor.
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
 	if (nbytes > INT_MAX) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -724,6 +729,11 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	EXIT_NOT_IMPLEMENTED(file->directory);
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
 
+	// A concurrent KernelClose() may already have closed this descriptor.
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
 	file->mutex.Lock();
@@ -778,6 +788,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	EXIT_NOT_IMPLEMENTED(file->directory);
 
+	// A concurrent KernelClose() may already have closed this descriptor.
 	if (!file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -949,6 +960,11 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	EXIT_NOT_IMPLEMENTED(file->directory);
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
 
+	// A concurrent KernelClose() may already have closed this descriptor.
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
 	file->mutex.Lock();
@@ -1057,6 +1073,11 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	auto file = g_files->GetFile(d);
 
 	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	// A concurrent KernelClose() may already have closed this descriptor.
+	if (!file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1170,6 +1191,11 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	auto file = g_files->GetFile(d);
 
 	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	// A concurrent KernelClose() may already have closed this descriptor.
+	if (!file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1356,6 +1382,7 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	// A concurrent KernelClose() may already have closed this descriptor.
 	if (!file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
