@@ -576,6 +576,8 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		// while they touch the host file.
 		Common::LockGuard lock(file->mutex);
 
+		// A concurrent close may have pinned the same File first; only the call
+		// that flips opened to false may go on to delete the descriptor.
 		if (!file->opened) {
 			return KERNEL_ERROR_EBADF;
 		}
