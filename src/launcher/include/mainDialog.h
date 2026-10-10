@@ -27,9 +27,13 @@ public:
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 
+	[[nodiscard]] static bool SkipBootSplash() { return m_skip_boot_splash; }
+	static void              SetSkipBootSplash(bool skip) { m_skip_boot_splash = skip; }
+
 	void resizeEvent(QResizeEvent* event) override;
 
 private:
+	static bool        m_skip_boot_splash;
 	MainDialogPrivate* m_p = nullptr;
 };
 

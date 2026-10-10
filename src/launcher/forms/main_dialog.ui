@@ -112,6 +112,13 @@
          </property>
         </widget>
        </item>
+       <item>
+        <widget class="QCheckBox" name="skip_boot_splash">
+         <property name="text">
+          <string>Skip the boot splash on startup</string>
+         </property>
+        </widget>
+       </item>
       </layout>
      </item>
     </layout>
