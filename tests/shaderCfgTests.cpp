@@ -14089,8 +14089,6 @@ void TestUniformSelectedDescriptorLoadAddress() {
   }
 }
 
-<<<<<<< HEAD
-=======
 void TestNativeScalarAtomicPayloadStaysOnGpu() {
   using namespace ShaderRecompiler::IR;
   // Exact final block from SAROS b62b494cb2567011: read a mutable flag,
@@ -14227,7 +14225,6 @@ void TestGpuScalarReadNeedsHostAddress() {
         "a scalar load addressed by another GPU-side load was evaluated on the host");
 }
 
->>>>>>> 637f278b (gpu: make GPU-side scalar loads resident before the shader runs)
 void TestBoundedScalarMaterialImageKeys() {
   using namespace ShaderRecompiler::IR;
   // SAROS 9fba2edffc549531: min(header count,64), scalar rows of 160 bytes,
@@ -15853,12 +15850,9 @@ int main() {
   TestGpuProducedWritableDescriptor();
   TestUniformSelectedWritableDescriptor();
   TestUniformSelectedDescriptorLoadAddress();
-<<<<<<< HEAD
-=======
   TestNativeScalarAtomicPayloadStaysOnGpu();
   TestGpuScalarReadSkipsUnreachedBlock();
   TestGpuScalarReadNeedsHostAddress();
->>>>>>> 637f278b (gpu: make GPU-side scalar loads resident before the shader runs)
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();
   TestTypedDescriptorRealCarryAndScalarLoads();
