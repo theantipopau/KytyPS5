@@ -601,7 +601,7 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	auto* file = g_files->GetFile(d);
+	auto file = g_files->GetFile(d);
 	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
