@@ -908,6 +908,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (!state.programs.vertex[0]) {
+		// GetGraphicsPrograms returns empty programs for pipelines the host cannot
+		// build (e.g. mesh shaders without host support or over host limits).
+		// Drop the draw before touching shader state below.
+		return false;
+	}
+	if (state.ps_active && !state.programs.pixel) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1104,16 +1113,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
-	const auto vertex_stages =
-	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
-	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	if (mesh_active && !state.programs.vertex[0]) {
-		// GetGraphicsPrograms skips mesh pipelines the host cannot build (no mesh
-		// shader support, or the workgroup exceeds host limits). Drop the draw.
+	if (!state.programs.vertex[0]) {
 		return;
 	}
-	uint32_t   mesh_groups   = 0;
-	uint32_t   mesh_instances = 0;
+	const auto vertex_stages =
+	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	const bool mesh_active = state.vertex_info[0].stage.program != nullptr &&
+	                         state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	if (mesh_active && state.ps_active && state.ps_input_info.stage.program == nullptr) {
+		return;
+	}
+	uint32_t mesh_groups    = 0;
+	uint32_t mesh_instances = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		if (mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable)) {
@@ -1148,39 +1159,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		mesh_instances     = draw.instance_count;
+		mesh_groups    = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		mesh_instances = draw.instance_count;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		// Issue #624: Astro's Playroom issues a 68734-group mesh dispatch that exceeds
-		// the host's maxMeshWorkGroupCount[0] (65535 on most drivers). Submitting it
-		// as-is is invalid Vulkan and aborts the emulator, so clamp the dispatch to
-		// the host limits and drop the tail instead of crashing. The tail geometry is
-		// missing, but the game keeps running.
-		const uint32_t clamped_groups =
-		    std::min(mesh_groups, limits.maxMeshWorkGroupCount[0]);
-		uint32_t clamped_instances =
-		    std::min(mesh_instances, limits.maxMeshWorkGroupCount[1]);
-		uint32_t clamped_total_groups = clamped_groups;
-		if (clamped_instances != 0 &&
-		    static_cast<uint64_t>(clamped_total_groups) * clamped_instances >
+		// Issue #624: some games issue mesh dispatches larger than the host's
+		// maxMeshWorkGroupCount. Submitting them as-is is invalid Vulkan, and a
+		// partial submission would render the wrong geometry (each workgroup
+		// re-reads the same push-constant draw range, so a clamped tail is not
+		// equivalent to the full dispatch). Skip the draw with a warning instead
+		// of aborting or submitting partial geometry.
+		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+		    mesh_instances > limits.maxMeshWorkGroupCount[1] ||
+		    static_cast<uint64_t>(mesh_groups) * mesh_instances >
 		        limits.maxMeshWorkGroupTotalCount) {
-			clamped_total_groups = static_cast<uint32_t>(limits.maxMeshWorkGroupTotalCount /
-			                                                     clamped_instances);
-		}
-		if (clamped_total_groups != mesh_groups || clamped_instances != mesh_instances) {
 			static std::atomic_bool workgroup_warned = false;
 			if (!workgroup_warned.exchange(true, std::memory_order_relaxed)) {
 				std::printf("Warning: mesh draw %ux%u exceeds host workgroup limits, "
-				            "clamping to %ux%u (max %u,%u,total %u)\n",
-				            mesh_groups, mesh_instances, clamped_total_groups, clamped_instances,
-				            limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupCount[1],
-				            limits.maxMeshWorkGroupTotalCount);
+				            "skipping draw (max %u,%u,total %u)\n",
+				            mesh_groups, mesh_instances, limits.maxMeshWorkGroupCount[0],
+				            limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount);
 			}
-			mesh_groups    = clamped_total_groups;
-			mesh_instances = clamped_instances;
-			if (mesh_groups == 0 || mesh_instances == 0) {
-				return;
-			}
+			return;
 		}
 	}
 
